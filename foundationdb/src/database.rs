@@ -24,6 +24,7 @@ use crate::transaction::*;
 use crate::{error, FdbError, FdbResult};
 
 use crate::error::FdbBindingError;
+use crate::options::TransactionOption;
 use futures::prelude::*;
 
 #[cfg(feature = "fdb-7_1")]
@@ -268,6 +269,26 @@ impl Database {
         )
     }
 
+    /// Works exactly like [Database::run] but takes an array of [TransactionOption]
+    /// and apply these options before start the retrying loop
+    pub async fn run_with_options<F, Fut, T>(
+        &self,
+        closure: F,
+        options: Vec<TransactionOption>,
+    ) -> Result<T, FdbBindingError>
+    where
+        F: Fn(RetryableTransaction, MaybeCommitted) -> Fut,
+        Fut: Future<Output = Result<T, FdbBindingError>>,
+    {
+        let mut transaction = self.create_retryable_trx()?;
+
+        for opt in options {
+            transaction.set_option(opt)?
+        }
+
+        self.run_internal(closure, transaction).await
+    }
+
     /// Runs a transactional function against this Database with retry logic.
     /// The associated closure will be called until a non-retryable FDBError
     /// is thrown or commit(), returns success.
@@ -289,7 +310,7 @@ impl Database {
     /// The closure will notify the user in case of a maybe_committed transaction in a previous run
     ///  with the `MaybeCommitted` provided in the closure.
     ///
-    /// This one can used as boolean with
+    /// This one can use as boolean with
     /// ```ignore
     /// db.run(|trx, maybe_committed| async {
     ///     if maybe_committed.into() {
@@ -302,10 +323,23 @@ impl Database {
         F: Fn(RetryableTransaction, MaybeCommitted) -> Fut,
         Fut: Future<Output = Result<T, FdbBindingError>>,
     {
-        let mut maybe_committed_transaction = false;
         // we just need to create the transaction once,
-        // in case there is a error, it will be reset automatically
-        let mut transaction = self.create_retryable_trx()?;
+        // in case there is an error, it will be reset automatically
+        let transaction = self.create_retryable_trx()?;
+
+        self.run_internal(closure, transaction).await
+    }
+
+    async fn run_internal<F, Fut, T>(
+        &self,
+        closure: F,
+        mut transaction: RetryableTransaction,
+    ) -> Result<T, FdbBindingError>
+    where
+        F: Fn(RetryableTransaction, MaybeCommitted) -> Fut,
+        Fut: Future<Output = Result<T, FdbBindingError>>,
+    {
+        let mut maybe_committed_transaction = false;
 
         loop {
             // executing the closure
